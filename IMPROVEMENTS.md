@@ -56,6 +56,14 @@ upstream issue.
   inverted end-to-end and the logits still matched to 1e-6. Kernel-level
   oracles (fixed inputs, exact outputs) are the only sharp validation for
   positional/attention machinery.
+- **Greedy generation on a random model diverges at near-ties by design:**
+  per-position logit sums match the float64 reference to ~1e-9 at pos 0,
+  growing to ~1e-2 by pos 11 (FMA contraction + libm paths + %.9g parse
+  rounding, amplified through layers). On an untrained model the logits are
+  near-degenerate, so an argmax over a 1e-3-level gap flips on noise (seen:
+  id 187 vs 361 at generation step 8, top-2 gap 0.0012). The full-chain id
+  comparison matched 12/13; the flip is numerical, not semantic. Trained
+  checkpoints (stories260K) have decisive logits and don't exhibit this.
 - **Aura byte-fallback rendering:** run.c emits raw bytes for byte pieces;
   aura strings are code-point sequences, so bytes ≥ 0x80 render as UTF-8
   encodings of their code points instead. Identical on ASCII (TinyStories

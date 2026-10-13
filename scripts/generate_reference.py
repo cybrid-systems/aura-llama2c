@@ -21,17 +21,21 @@ def main():
 
     ids = encode(text, vocab_size, scores, pieces, table, bos=True)
     pos = 0
+    logits = None
     for tid in ids:
-        forward(m, tid, pos)
+        logits = forward(m, tid, pos)
         pos += 1
+    # greedy: the logits from the last prompt position give the first
+    # generated id; each new id is forwarded exactly once (same as run.c
+    # and as lib/l2c/sampler.aura's generate-ids - the earlier version
+    # double-forwarded the last prompt token, corrupting the KV cache)
     for _ in range(steps):
-        logits = forward(m, ids[-1], pos)
         best, bv = 0, logits[0]
         for i in range(1, m.vocab):
             if logits[i] > bv:
                 best, bv = i, logits[i]
         ids.append(best)
-        forward(m, best, pos)
+        logits = forward(m, best, pos)
         pos += 1
     print(",".join(str(i) for i in ids))
 
