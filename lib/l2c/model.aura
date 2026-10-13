@@ -1,0 +1,353 @@
+; lib/l2c/model.aura — Llama-2 forward pass in Aura (port of karpathy/llama2.c run.c)
+;
+; Status: Phase 1 — logits oracle vs pure-python float64 reference.
+;   Greedy (argmax) sampling only; tokenizer is Phase 2 (token ids in/out).
+;
+; Requires: AURA_PATH includes this lib/ so (require "l2c/model") resolves.
+; Weight file: produced by scripts/export_weights.py (see header there).
+;
+; Face: Soft (AURA_SANDBOX=off AURA_PIPELINE_STRICT=0). Loops are written as
+; named lets / tail recursion (deep non-tail recursion is depth-capped, #4454)
+; and all activation buffers are preallocated vectors.
+
+(require "std/io")
+
+;; ── config + weights (globals; loader fills them) ──────────────────
+
+(define l2c:dim 0)
+(define l2c:hidden 0)
+(define l2c:n-layers 0)
+(define l2c:n-heads 0)
+(define l2c:n-kv-heads 0)
+(define l2c:vocab 0)
+(define l2c:seq-len 0)
+(define l2c:head-size 0)
+(define l2c:kv-dim 0)
+
+(define l2c:tok-emb #f)
+(define l2c:rms-att #f)
+(define l2c:wq #f)
+(define l2c:wk #f)
+(define l2c:wv #f)
+(define l2c:wo #f)
+(define l2c:rms-ffn #f)
+(define l2c:w1 #f)
+(define l2c:w2 #f)
+(define l2c:w3 #f)
+(define l2c:rms-final #f)
+(define l2c:wcls #f)          ; shared with tok-emb for stories260K
+
+;; activations + cache (preallocated once by the loader)
+(define l2c:x #f)
+(define l2c:xb #f)
+(define l2c:xb2 #f)
+(define l2c:hb #f)
+(define l2c:hb2 #f)
+(define l2c:q #f)
+(define l2c:k #f)             ; per-layer scratch (kv_dim)
+(define l2c:v #f)
+(define l2c:att #f)           ; seq_len scratch
+(define l2c:logits #f)
+(define l2c:kcache #f)        ; n_layers * seq_len * kv_dim
+(define l2c:vcache #f)
+
+;; ── loader ──────────────────────────────────────────────────────────
+
+; consume all remaining lines as floats, return vector.
+; lines-list is dropped per-file so the string list becomes garbage fast
+; (live-heap mark cost grows with live heap, #4474 family).
+(define (l2c:read-float-file path)
+  (let* ((lines (file->lines path))
+         (count (length lines))
+         (v (make-vector count 0.0)))
+    (let loop ((i 0) (ls lines))
+      (if (pair? ls)
+          (begin
+            (vector-set! v i (string->number (car ls)))
+            (loop (+ i 1) (cdr ls)))))
+    v))
+
+(define (l2c:read-config path)
+  (let* ((cfg (string-split (car (file->lines path)) " ")))
+    (set! l2c:dim (string->number (list-ref cfg 0)))
+    (set! l2c:hidden (string->number (list-ref cfg 1)))
+    (set! l2c:n-layers (string->number (list-ref cfg 2)))
+    (set! l2c:n-heads (string->number (list-ref cfg 3)))
+    (set! l2c:n-kv-heads (string->number (list-ref cfg 4)))
+    (set! l2c:vocab (string->number (list-ref cfg 5)))
+    (set! l2c:seq-len (string->number (list-ref cfg 6)))
+    (set! l2c:head-size (/ l2c:dim l2c:n-heads))
+    (set! l2c:kv-dim (* l2c:head-size l2c:n-kv-heads))
+    'cfg))
+
+(define (l2c:load dir)
+  (l2c:read-config (string-append dir "/config.txt"))
+  (set! l2c:tok-emb (l2c:read-float-file (string-append dir "/tok_emb.txt")))
+  (set! l2c:rms-att (l2c:read-float-file (string-append dir "/rms_att.txt")))
+  (set! l2c:wq (l2c:read-float-file (string-append dir "/wq.txt")))
+  (set! l2c:wk (l2c:read-float-file (string-append dir "/wk.txt")))
+  (set! l2c:wv (l2c:read-float-file (string-append dir "/wv.txt")))
+  (set! l2c:wo (l2c:read-float-file (string-append dir "/wo.txt")))
+  (set! l2c:rms-ffn (l2c:read-float-file (string-append dir "/rms_ffn.txt")))
+  (set! l2c:w1 (l2c:read-float-file (string-append dir "/w1.txt")))
+  (set! l2c:w2 (l2c:read-float-file (string-append dir "/w2.txt")))
+  (set! l2c:w3 (l2c:read-float-file (string-append dir "/w3.txt")))
+  (set! l2c:rms-final (l2c:read-float-file (string-append dir "/rms_final.txt")))
+  (if (file-exists? (string-append dir "/wcls.txt"))
+      (set! l2c:wcls (l2c:read-float-file (string-append dir "/wcls.txt")))
+      (set! l2c:wcls l2c:tok-emb))  ; shared classifier
+
+      ;; activations + caches
+      (set! l2c:x (make-vector l2c:dim 0.0))
+      (set! l2c:xb (make-vector l2c:dim 0.0))
+      (set! l2c:xb2 (make-vector l2c:dim 0.0))
+      (set! l2c:hb (make-vector l2c:hidden 0.0))
+      (set! l2c:hb2 (make-vector l2c:hidden 0.0))
+      (set! l2c:q (make-vector l2c:dim 0.0))
+      (set! l2c:k (make-vector l2c:kv-dim 0.0))
+      (set! l2c:v (make-vector l2c:kv-dim 0.0))
+      (set! l2c:att (make-vector l2c:seq-len 0.0))
+      (set! l2c:logits (make-vector l2c:vocab 0.0))
+      (set! l2c:kcache (make-vector (* l2c:n-layers l2c:seq-len l2c:kv-dim) 0.0))
+      (set! l2c:vcache (make-vector (* l2c:n-layers l2c:seq-len l2c:kv-dim) 0.0))
+      'loaded)
+
+;; ── math kernels ────────────────────────────────────────────────────
+
+; out[i] = w[offset+i] * s * x[i], s = 1/sqrt(mean(x^2) + 1e-5)
+(define (l2c:rmsnorm! out x w offset)
+  (let ((ss (let loop ((i 0) (acc 0.0))
+              (if (< i l2c:dim)
+                  (loop (+ i 1)
+                        (+ acc (* (vector-ref x i) (vector-ref x i))))
+                  acc))))
+    (let ((s (/ 1.0 (sqrt (+ (/ ss l2c:dim) 1.0e-5)))))
+      (let loop ((i 0))
+        (if (< i l2c:dim)
+            (begin
+              (vector-set! out i (* s
+                                    (vector-ref w (+ offset i))
+                                    (vector-ref x i)))
+              (loop (+ i 1))))))))
+
+; out[0..rows) = W (rows x cols, row-major) @ x, weights at W[woff..]
+(define (l2c:matmul! out W x rows cols woff)
+  (let loop ((r 0))
+    (if (< r rows)
+        (begin
+          (vector-set! out r
+                       (let inner ((c 0) (acc 0.0))
+                         (if (< c cols)
+                             (inner (+ c 1)
+                                    (+ acc (* (vector-ref W (+ woff (+ (* r cols) c)))
+                                              (vector-ref x c))))
+                             acc)))
+          (loop (+ r 1))))))
+
+; apply RoPE in place: vec has `n-heads` heads of head_size, rotate pairs
+; (2i, 2i+1) within each head by angle pos / 10000^(2i/head_size)
+(define (l2c:rope! vec pos n-heads)
+  (let loop ((h 0))
+    (if (< h n-heads)
+        (begin
+          (let loop2 ((i 0))
+            (if (< i (/ l2c:head-size 2))
+                (begin
+                  (let* ((freq (/ 1.0 (expt 10000.0 (/ (* 2.0 i) l2c:head-size))))
+                         (angle (* pos freq))
+                         (c (cos angle))
+                         (s (sin angle))
+                         (i0 (+ (* h l2c:head-size) (* 2 i)))
+                         (i1 (+ i0 1))
+                         (v0 (vector-ref vec i0))
+                         (v1 (vector-ref vec i1)))
+                    (vector-set! vec i0 (- (* v0 c) (* v1 s)))
+                    (vector-set! vec i1 (+ (* v0 s) (* v1 c))))
+                  (loop2 (+ i 1)))))
+          (loop (+ h 1))))))
+
+; in-place softmax over vec[0..n)
+(define (l2c:softmax! vec n)
+  (let ((mx (let loop ((i 1) (m (vector-ref vec 0)))
+              (if (< i n)
+                  (loop (+ i 1) (max m (vector-ref vec i)))
+                  m))))
+    (let loop ((i 0) (sum 0.0))
+      (if (< i n)
+          (let ((e (exp (- (vector-ref vec i) mx))))
+            (vector-set! vec i e)
+            (loop (+ i 1) (+ sum e)))
+          (let loop2 ((i 0))
+            (if (< i n)
+                (begin
+                  (vector-set! vec i (/ (vector-ref vec i) sum))
+                  (loop2 (+ i 1)))))))))
+
+;; ── forward ─────────────────────────────────────────────────────────
+
+; runs one token at position pos; fills l2c:logits
+(define (l2c:forward token pos)
+  ;; x = embedding row
+  (let loop ((i 0))
+    (if (< i l2c:dim)
+        (begin
+          (vector-set! l2c:x i (vector-ref l2c:tok-emb (+ (* token l2c:dim) i)))
+          (loop (+ i 1)))))
+  (let loopl ((l 0))
+    (if (< l l2c:n-layers)
+        (begin
+          ;; attention block
+          (l2c:rmsnorm! l2c:xb l2c:x l2c:rms-att (* l l2c:dim))
+          (l2c:matmul! l2c:q l2c:wq l2c:xb l2c:dim l2c:dim (* l l2c:dim l2c:dim))
+          (l2c:matmul! l2c:k l2c:wk l2c:xb l2c:kv-dim l2c:dim (* l l2c:dim l2c:kv-dim))
+          (l2c:matmul! l2c:v l2c:wv l2c:xb l2c:kv-dim l2c:dim (* l l2c:dim l2c:kv-dim))
+          ;; RoPE: q has n-heads, k has n-kv-heads
+          (l2c:rope! l2c:q pos l2c:n-heads)
+          (l2c:rope! l2c:k pos l2c:n-kv-heads)
+          ;; stash k/v into the cache at this position
+          (let ((kv-off (+ (* l l2c:seq-len l2c:kv-dim) (* pos l2c:kv-dim))))
+            (let loop ((i 0))
+              (if (< i l2c:kv-dim)
+                  (begin
+                    (vector-set! l2c:kcache (+ kv-off i) (vector-ref l2c:k i))
+                    (vector-set! l2c:vcache (+ kv-off i) (vector-ref l2c:v i))
+                    (loop (+ i 1))))))
+          ;; attention per head
+          (let looph ((h 0))
+            (if (< h l2c:n-heads)
+                (begin
+                  (let* ((kvh (/ h (/ l2c:n-heads l2c:n-kv-heads)))
+                         (att-off (* h l2c:head-size)))
+                    ;; scores over t = 0..pos
+                    (let loopt ((t 0))
+                      (if (<= t pos)
+                          (begin
+                            (vector-set! l2c:att t
+                                         (/ (let ((kbase (+ (* l l2c:seq-len l2c:kv-dim)
+                                                            (* t l2c:kv-dim)
+                                                            (* kvh l2c:head-size))))
+                                              (let inner ((i 0) (acc 0.0))
+                                                (if (< i l2c:head-size)
+                                                    (inner (+ i 1)
+                                                           (+ acc (* (vector-ref l2c:q (+ att-off i))
+                                                                     (vector-ref l2c:kcache (+ kbase i)))))
+                                                    acc)))
+                                            (sqrt l2c:head-size)))
+                            (loopt (+ t 1)))))
+                    (l2c:softmax! l2c:att (+ pos 1))
+                    ;; weighted sum of v
+                    (let loopi ((i 0))
+                      (if (< i l2c:head-size)
+                          (begin
+                            (vector-set! l2c:xb (+ att-off i) 0.0)
+                            (let loopt ((t 0) (acc 0.0))
+                              (if (<= t pos)
+                                  (loopt (+ t 1)
+                                         (+ acc (* (vector-ref l2c:att t)
+                                                   (vector-ref l2c:vcache
+                                                              (+ (* l l2c:seq-len l2c:kv-dim)
+                                                                 (* t l2c:kv-dim)
+                                                                 (* kvh l2c:head-size)
+                                                                 i)))))
+                                  (vector-set! l2c:xb (+ att-off i) acc)))
+                            (loopi (+ i 1)))))
+                    )
+                  (looph (+ h 1)))))
+          ;; wo + residual
+          (l2c:matmul! l2c:xb2 l2c:wo l2c:xb l2c:dim l2c:dim (* l l2c:dim l2c:dim))
+          (let loop ((i 0))
+            (if (< i l2c:dim)
+                (begin
+                  (vector-set! l2c:x i (+ (vector-ref l2c:x i) (vector-ref l2c:xb2 i)))
+                  (loop (+ i 1)))))
+          ;; ffn block
+          (l2c:rmsnorm! l2c:xb l2c:x l2c:rms-ffn (* l l2c:dim))
+          (l2c:matmul! l2c:hb l2c:w1 l2c:xb l2c:hidden l2c:dim (* l l2c:hidden l2c:dim))
+          (l2c:matmul! l2c:hb2 l2c:w3 l2c:xb l2c:hidden l2c:dim (* l l2c:hidden l2c:dim))
+          ;; hb = silu(hb) * hb2, then x += w2 @ hb
+          (let loop ((i 0))
+            (if (< i l2c:hidden)
+                (let* ((v1 (vector-ref l2c:hb i))
+                       (v2 (vector-ref l2c:hb2 i))
+                       (sig (/ 1.0 (+ 1.0 (exp (- 0.0 v1))))))
+                  (vector-set! l2c:hb i (* v1 sig v2))
+                  (loop (+ i 1)))))
+          (l2c:matmul! l2c:xb2 l2c:w2 l2c:hb l2c:dim l2c:hidden (* l l2c:dim l2c:hidden))
+          (let loop ((i 0))
+            (if (< i l2c:dim)
+                (begin
+                  (vector-set! l2c:x i (+ (vector-ref l2c:x i) (vector-ref l2c:xb2 i)))
+                  (loop (+ i 1)))))
+          (loopl (+ l 1)))))
+  ;; final rmsnorm + logits
+  (l2c:rmsnorm! l2c:x l2c:x l2c:rms-final 0)
+  (l2c:matmul! l2c:logits l2c:wcls l2c:x l2c:vocab l2c:dim 0)
+  'ok)
+
+;; ── sampling + driver ───────────────────────────────────────────────
+
+(define (l2c:argmax vec n)
+  (let loop ((i 1) (best 0) (bv (vector-ref vec 0)))
+    (if (< i n)
+        (let ((v (vector-ref vec i)))
+          (if (> v bv) (loop (+ i 1) i v) (loop (+ i 1) best bv)))
+        best)))
+
+; run the prompt greedily: forward each token, emit (pos . argmax) pairs;
+; continues generation for extra-steps tokens appending the argmax.
+; Returns the list of argmax ids for prompt positions followed by extras.
+(define (l2c:greedy tokens extra-steps)
+  (let loop ((toks tokens) (pos 0) (rev-ids '()) (pending extra-steps))
+    (if (pair? toks)
+        (begin
+          (l2c:forward (car toks) pos)
+          (loop (cdr toks) (+ pos 1)
+                (cons (l2c:argmax l2c:logits l2c:vocab) rev-ids)
+                pending))
+        (if (> pending 0)
+            (let ((next (car rev-ids)))
+              (l2c:forward next pos)
+              (loop '() (+ pos 1)
+                    (cons (l2c:argmax l2c:logits l2c:vocab) rev-ids)
+                    (- pending 1)))
+            (reverse rev-ids)))))
+
+; driver: (l2c:main '(1 8 61) 2) — prints logits per position (full precision)
+; and the greedy argmax id per position. L2C_WEIGHTS_DIR selects the model dir.
+(define (l2c:main tokens extra-steps)
+  (let ((w (or (getenv "L2C_WEIGHTS_DIR") "model/stories260K")))
+    (l2c:load w)
+    (let loop ((toks tokens) (pos 0))
+      (if (pair? toks)
+          (begin
+            (l2c:forward (car toks) pos)
+            (display "pos ") (display pos)
+            (display " argmax ") (display (l2c:argmax l2c:logits l2c:vocab))
+            (newline)
+            (let loop2 ((i 0))
+              (if (< i l2c:vocab)
+                  (begin
+                    (display (number->string (vector-ref l2c:logits i)))
+                    (newline)
+                    (loop2 (+ i 1)))))
+            (loop (cdr toks) (+ pos 1)))
+          (if (> extra-steps 0)
+              (let ((next (l2c:argmax l2c:logits l2c:vocab)))
+                (l2c:main-extra next (length tokens) (- extra-steps 1)))
+              'done)))))
+
+; continuation driver used by l2c:main for generated tokens
+(define (l2c:main-extra token pos remaining)
+  (l2c:forward token pos)
+  (display "pos ") (display pos)
+  (display " argmax ") (display (l2c:argmax l2c:logits l2c:vocab))
+  (newline)
+  (let loop2 ((i 0))
+    (if (< i l2c:vocab)
+        (begin
+          (display (number->string (vector-ref l2c:logits i)))
+          (newline)
+          (loop2 (+ i 1)))))
+  (if (> remaining 0)
+      (l2c:main-extra (l2c:argmax l2c:logits l2c:vocab) (+ pos 1) (- remaining 1))
+      'done))

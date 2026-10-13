@@ -1,0 +1,11 @@
+# machine-readable status; keep in sync with README table
+export_weights=done
+forward_pass=done
+kernel_tests=done           # rope/softmax/rmsnorm/matmul bit-exact (1e-12)
+e2e_tiny=done               # argmax 5/5, worst |dlogit| 2.2e-3 (tol 1e-2)
+greedy_generation=done      # token ids only
+stories260k_e2e=partial     # runs; load+forward minutes-scale on Soft (GC-bound)
+tokenizer=todo              # sentencepiece BPE tok512.bin
+sampling=todo               # temperature / top-p
+# perf baseline (RelWithDebInfo aura build, stories260K):
+#   load(260K floats via text) + 1 token forward = see PERF260 below (filled when measured)

@@ -1,0 +1,81 @@
+; tests/kernels.aura — kernel unit tests for lib/l2c/model.aura
+;
+; Prints rope/softmax/rmsnorm/matmul results for fixed inputs, in the same
+; layout as tests/kernel_oracle.py's expected output (%.17g via
+; number->string). tests/run_tests.sh diffs the two.
+;
+; Loads the model module but NOT the weights: config globals are set by hand.
+
+(require "l2c/model")
+
+(set! l2c:head-size 8)
+(set! l2c:dim 8)
+(set! l2c:n-heads 1)
+
+;; rope: one head, head_size 8, pos 3
+(define v (make-vector 8 0.0))
+(let loop ((i 0))
+  (if (< i 8)
+      (begin
+        (vector-set! v i (list-ref '(1.0 0.0 -2.0 0.5 3.0 -1.5 0.25 2.0) i))
+        (loop (+ i 1)))))
+(l2c:rope! v 3 1)
+(display "rope") (newline)
+(let loop ((i 0))
+  (if (< i 8)
+      (begin
+        (display (number->string (vector-ref v i))) (newline)
+        (loop (+ i 1)))))
+
+;; softmax
+(define s (make-vector 4 0.0))
+(vector-set! s 0 1.2)
+(vector-set! s 1 -0.3)
+(vector-set! s 2 0.0)
+(vector-set! s 3 2.7)
+(l2c:softmax! s 4)
+(display "softmax") (newline)
+(set! l2c:dim 8)
+(let loop ((i 0))
+  (if (< i 4)
+      (begin
+        (display (number->string (vector-ref s i))) (newline)
+        (loop (+ i 1)))))
+
+;; rmsnorm: x and w fixed; rmsnorm! reads l2c:dim
+(define rx (make-vector 8 0.0))
+(define rw (make-vector 8 0.0))
+(let loop ((i 0))
+  (if (< i 8)
+      (begin
+        (vector-set! rx i (list-ref '(0.5 -1.25 2.0 0.0 3.5 -0.75 1.5 -2.0) i))
+        (vector-set! rw i (+ 0.1 (* 0.01 i)))
+        (loop (+ i 1)))))
+(define ro (make-vector 8 0.0))
+(l2c:rmsnorm! ro rx rw 0)
+(display "rmsnorm") (newline)
+(let loop ((i 0))
+  (if (< i 8)
+      (begin
+        (display (number->string (vector-ref ro i))) (newline)
+        (loop (+ i 1)))))
+
+;; matmul: W 3x2 @ [2,-1]
+(define W (make-vector 6 0.0))
+(vector-set! W 0 1.0)
+(vector-set! W 1 -2.0)
+(vector-set! W 2 3.0)
+(vector-set! W 3 0.5)
+(vector-set! W 4 -1.0)
+(vector-set! W 5 2.25)
+(define mv (make-vector 2 0.0))
+(vector-set! mv 0 2.0)
+(vector-set! mv 1 -1.0)
+(define mo (make-vector 3 0.0))
+(l2c:matmul! mo W mv 3 2 0)
+(display "matmul") (newline)
+(let loop ((i 0))
+  (if (< i 3)
+      (begin
+        (display (number->string (vector-ref mo i))) (newline)
+        (loop (+ i 1)))))

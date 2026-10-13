@@ -1,0 +1,7 @@
+# generated artifacts
+model/*.bin
+model/stories260K/
+!model/tiny.bin
+__pycache__/
+*.pyc
+model/*.weights.txt

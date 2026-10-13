@@ -1,0 +1,52 @@
+# Aura findings from the llama2.c port
+
+Aura tip at port time: `45c8bf425` (2026-10-13). Face: Soft
+(`AURA_SANDBOX=off AURA_PIPELINE_STRICT=0`), `AURA_PATH` including aura's
+`lib/`, RelWithDebInfo build. Each finding has a minimal repro and an
+upstream issue.
+
+## Filed upstream
+
+| Issue | Finding | Hit while |
+|---|---|---|
+| [#4500](https://github.com/cybrid-systems/aura/issues/4500) | `lib/std/encoding.aura` hex/base64 wrappers hang forever on any input: `(define (hex-encode d) (encoding:hex-encode d))` — the colon-qualified name resolves to the module's own export (the wrapper itself), not the native prim registered as `encoding:hex-encode` in `evaluator_primitives_char.cpp:308`. Infinite tail recursion, no depth-guard trip. All of hex-encode/hex-decode/base64-encode/base64-decode are dead on HEAD. | binary model loading plan (hex path), first probe |
+| [#4496](https://github.com/cybrid-systems/aura/issues/4496) | std missing common Scheme bindings: assoc/assq/iota/case/do/vector-fill!/vector-map/vector-copy/string->symbol/symbol->string/let-values/exit (exit also can't stop the program) | loader/section walking wanted iota+assoc; test runners want exit |
+| [#4497](https://github.com/cybrid-systems/aura/issues/4497) | `vector-ref` out-of-range returns `<unknown>`, execution continues, exit 0 — silent data poisoning for index math (this port is ALL index math) | forward pass index arithmetic |
+| [#4498](https://github.com/cybrid-systems/aura/issues/4498) | reader: `.5`/`1.` rejected as parse errors; `1/2` silently reads as `(1 /2 3)` — two tokens, no diagnostic | transcribing weight constants / formulas |
+| [#4499](https://github.com/cybrid-systems/aura/issues/4499) | `(/ 7 2)` → 3 (int truncation): every float division site needs a manual `(* 1.0 x)` or literal floats; port writes `(* 1.0 ...)` guards everywhere | scaling factors (attention /sqrt(hs), rmsnorm mean) |
+
+## Unfiled (measurement first / design)
+
+- **Unboxed float vectors (the headline).** Every `vector-ref`/`vector-set!`
+  of a float boxes/unboxes; every `+`/`*` allocates an intermediate boxed
+  double. Combined with the file-mode partial reclaim (#4474 family: whole
+  live heap marked every 128 allocations), loading 260K float weights
+  through text takes minutes and per-token cost is memory-bound, not
+  FLOP-bound. A typed `f64vector` primitive (or boxed-value elision in
+  numeric loops) would collapse both. The C reference does 260K MACs in
+  ~0.3 ms; measured Aura numbers TBD in STATE.txt.
+- **`file->lines` on multi-MB text is the loader bottleneck.** Splitting
+  3.4 MB into 260K strings holds the whole list live while parsing; sections
+  are now split into per-section files to bound live-heap growth. A
+  streaming line-reader primitive (or lazy lines) would remove the loader
+  workaround entirely.
+- **`string->number` throughput** on 260K single-float lines is a visible
+  slice of load time; a `read-f64vector`-style bulk primitive would remove
+  text parsing altogether (binary read is 8-bit clean today, but there is
+  no way to reinterpret 4 bytes as float32 — no bit-cast/struct primitive).
+- **`setenv`/`getenv`**: `getenv` exists, `setenv` does not (driver env
+  selection currently goes through the shell).
+- **Deep recursion is depth-capped (#4454) so all loops are written as tail
+  calls** — fine, but a `do`/`for` looping form (#4496) would make hot
+  kernels read like run.c and drop the named-let boilerplate.
+
+## Validation notes (for future ports)
+
+- Kernel-level oracles (fixed input vectors → expected %.17g output,
+  compared at 1e-12) catch what end-to-end logits cannot: with random
+  weights the logits are dominated by the `wcls·emb` direct path —
+  attention/RoPE perturbations sit at 1e-6 even when attention weights are
+  scaled ×20. End-to-end argmax equality is a smoke test, not a proof.
+- The end-to-end float64 reference must mirror accumulation order to stay
+  near 1e-6; residual ~2e-3 comes from transcendental rounding paths
+  (C exp/expt vs python math) amplified by live attention scores.
