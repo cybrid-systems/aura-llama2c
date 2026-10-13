@@ -21,10 +21,11 @@ upstream issue.
   of a float boxes/unboxes; every `+`/`*` allocates an intermediate boxed
   double. Combined with the file-mode partial reclaim (#4474 family: whole
   live heap marked every 128 allocations), loading 260K float weights
-  through text takes minutes and per-token cost is memory-bound, not
-  FLOP-bound. A typed `f64vector` primitive (or boxed-value elision in
-  numeric loops) would collapse both. The C reference does 260K MACs in
-  ~0.3 ms; measured Aura numbers TBD in STATE.txt.
+  through text did not finish in 30 minutes of wall time, and the 21K-param
+  tiny model costs ~30-60 s per token (GC-bound, not FLOP-bound). The C
+  reference does 260K MACs in ~0.3 ms. A typed `f64vector` primitive (or
+  boxed-value elision in numeric loops) would collapse both — filed as
+  [#4501](https://github.com/cybrid-systems/aura/issues/4501).
 - **`file->lines` on multi-MB text is the loader bottleneck.** Splitting
   3.4 MB into 260K strings holds the whole list live while parsing; sections
   are now split into per-section files to bound live-heap growth. A
@@ -39,6 +40,26 @@ upstream issue.
 - **Deep recursion is depth-capped (#4454) so all loops are written as tail
   calls** — fine, but a `do`/`for` looping form (#4496) would make hot
   kernels read like run.c and drop the named-let boilerplate.
+
+## Port-side lessons (our bugs, not aura's)
+
+- **#4499 bit its own port:** `(/ sam:state 2147483647)` on two exact ints
+  truncated to 0 forever — the sampler always picked the top-probability
+  token and the top-p test caught it as a constant-output failure. Fixed by
+  `(* 1.0 sam:state)` before dividing.
+- **Run.c tokenizer convention:** sentencepiece U+2581 must be exported as a
+  literal space; otherwise run.c's dummy-prefix `str_lookup(" ")` returns -1
+  and run.c segfaults on `vocab[-1]`. This is a run.c/exporter contract, not
+  an aura bug.
+- **Random-weight end-to-end oracles are insensitive:** with scale-0.05
+  weights the logits are dominated by the `wcls·emb` direct path; RoPE was
+  inverted end-to-end and the logits still matched to 1e-6. Kernel-level
+  oracles (fixed inputs, exact outputs) are the only sharp validation for
+  positional/attention machinery.
+- **Aura byte-fallback rendering:** run.c emits raw bytes for byte pieces;
+  aura strings are code-point sequences, so bytes ≥ 0x80 render as UTF-8
+  encodings of their code points instead. Identical on ASCII (TinyStories
+  domain); documented divergence otherwise.
 
 ## Validation notes (for future ports)
 

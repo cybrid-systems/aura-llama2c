@@ -1,0 +1,148 @@
+; lib/l2c/tokenizer.aura — sentencepiece BPE tokenizer (port of run.c's
+; build_tokenizer/decode/encode)
+;
+; Weight-of-record semantics (run.c master, karpathy/llama2.c):
+;   encode: [BOS?] + [dummy " " prefix if text non-empty] + per-code-point
+;           vocab lookup (byte-fallback id = byte+3) + pair-merge loop that
+;           repeatedly merges the consecutive pair with the highest score
+;   decode: id 1/2 specials skip; byte-fallback ids 3..258 emit raw byte
+;           (id-3); else vocab piece, with run.c's strip-leading-space after
+;           BOS (PR #89)
+;
+; Vocab source: model/tokenizer.txt (scripts/export_tokenizer_sp.py), lines
+; "<score> <len> <b0> <b1> ...". Aura strings are code-point sequences, so
+; pieces are stored as code points equal to their UTF-8 byte values; encode
+; UTF-8-encodes each input code point with pure arithmetic (no bit ops).
+; Byte-exact output matches run.c on ASCII; raw byte-fallback bytes >0x7F
+; render as code points (see IMPROVEMENTS.md).
+
+(require "std/io")
+(require "std/hash")
+(require "std/string")
+
+(define tok:vocab-size 0)
+(define tok:pieces #f)    ; vector of strings (code points = piece bytes)
+(define tok:scores #f)    ; vector of floats
+(define tok:table #f)     ; piece string -> id
+
+(define (tok:load path)
+  (let* ((lines (file->lines path)))
+    (set! tok:vocab-size (string->number (car lines)))
+    (set! lines (cdr lines))
+    (set! tok:pieces (make-vector tok:vocab-size ""))
+    (set! tok:scores (make-vector tok:vocab-size 0.0))
+    (set! tok:table (make-hash))
+    (let loop ((i 0) (ls lines))
+      (if (and (< i tok:vocab-size) (pair? ls))
+          (begin
+            (let* ((parts (string-split (car ls) " "))
+                   (score (string->number (list-ref parts 0)))
+                   (len (string->number (list-ref parts 1)))
+                   (bls (list-tail parts 2)))
+              (vector-set! tok:scores i score)
+              (vector-set! tok:pieces i
+                           (list->string
+                            (let bl ((j 0) (acc '()))
+                              (if (< j len)
+                                  (bl (+ j 1)
+                                      (cons (integer->char
+                                             (string->number (list-ref bls j)))
+                                            acc))
+                                  (reverse acc)))))
+              (hash-set! tok:table (vector-ref tok:pieces i) i))
+            (loop (+ i 1) (cdr ls)))))
+    'tok-loaded))
+
+; UTF-8 bytes of a code point, pure arithmetic, as a list
+(define (tok:utf8-encode cp)
+  (if (< cp 128)
+      (list cp)
+      (if (< cp 2048)
+          (list (+ 192 (quotient cp 64)) (+ 128 (remainder cp 64)))
+          (if (< cp 65536)
+              (list (+ 224 (quotient cp 4096))
+                    (+ 128 (remainder (quotient cp 64) 64))
+                    (+ 128 (remainder cp 64)))
+              (list (+ 240 (quotient cp 262144))
+                    (+ 128 (remainder (quotient cp 4096) 64))
+                    (+ 128 (remainder (quotient cp 64) 64))
+                    (+ 128 (remainder cp 64)))))))
+
+(define (tok:lookup-bytes bls)
+  (hash-ref tok:table
+            (list->string (map integer->char bls))
+            #f))
+
+; encode text -> list of ids (BOS prepended when bos is true, like run.c's
+; encode(..., bos=1, eos=0, ...))
+(define (tok:encode text bos)
+  (let ((ids '()))
+    (if bos (set! ids (cons 1 ids)))
+    (if (> (string-length text) 0)
+        (let ((space-id (tok:lookup-bytes '(32))))
+          (if space-id (set! ids (cons space-id ids)))))
+    ;; per-code-point initial pass
+    (let loop ((i 0))
+      (if (< i (string-length text))
+          (begin
+            (let* ((cp (char->integer (string-ref text i)))
+                   (bls (tok:utf8-encode cp))
+                   (id (tok:lookup-bytes bls)))
+              (if id
+                  (set! ids (cons id ids))
+                  (let fb ((bs bls))
+                    (if (pair? bs)
+                        (begin
+                          (set! ids (cons (+ 3 (car bs)) ids))
+                          (fb (cdr bs)))))))
+            (loop (+ i 1)))))
+    (set! ids (reverse ids))
+    ;; pair-merge loop: repeatedly merge the consecutive pair whose
+    ;; concatenation is in the vocab with the highest score
+    (let* ((n0 (length ids))
+           (v (list->vector ids)))
+      (let outer ((n n0))
+        (let scan ((i 0) (bs -1.0e10) (bid #f) (bidx #f))
+          (if (< i (- n 1))
+              (let* ((cat (string-append (vector-ref tok:pieces (vector-ref v i))
+                                         (vector-ref tok:pieces (vector-ref v (+ i 1)))))
+                     (mid (hash-ref tok:table cat #f)))
+                (if (and mid (> (vector-ref tok:scores mid) bs))
+                    (scan (+ i 1) (vector-ref tok:scores mid) mid i)
+                    (scan (+ i 1) bs bid bidx)))
+              (begin
+                (if bidx
+                    (begin
+                      (vector-set! v bidx bid)
+                      (let shift ((j (+ bidx 1)))
+                        (if (< j (- n 1))
+                            (begin
+                              (vector-set! v j (vector-ref v (+ j 1)))
+                              (shift (+ j 1)))))
+                      (outer (- n 1)))
+                    (let out ((i 0) (acc '()))
+                      (if (< i n)
+                          (out (+ i 1) (cons (vector-ref v i) acc))
+                          (reverse acc)))))))))))
+
+; decode a single token with run.c's decode(prev, token) semantics;
+; returns a string (possibly "")
+(define (tok:decode-piece prev id)
+  (cond
+    ((< id 3) "")
+    ((<= id 258) (list->string (list (integer->char (- id 3)))))
+    (else
+     (let* ((piece (vector-ref tok:pieces id))
+            (plen (string-length piece)))
+       (if (and (= prev 1) (> plen 0) (= (char->integer (string-ref piece 0)) 32))
+           (substring piece 1 plen)
+           piece)))))
+
+; decode an id list to a string
+(define (tok:decode ids)
+  (let loop ((ls ids) (prev -1) (out ""))
+    (if (pair? ls)
+        (loop (cdr ls)
+              (car ls)
+              (string-append out (tok:decode-piece prev (car ls))))
+        out)))

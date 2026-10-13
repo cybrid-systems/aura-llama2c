@@ -1,0 +1,34 @@
+; lib/l2c/generate.aura — end-to-end text generation driver
+;
+; (l2c:generate "Once upon a time" 10 0.0 0.9)
+;   encodes the prompt (BOS + dummy prefix like run.c), runs the forward
+;   pass over it, then samples n-steps tokens, printing each decoded piece
+;   as it is generated (run.c's incremental decode with the BOS
+;   strip-leading-space rule).
+;
+; Environment:
+;   L2C_WEIGHTS_DIR  model dir (default model/tiny)
+;   L2C_TOKENIZER    tokenizer.txt path (default model/tokenizer.txt)
+
+(require "l2c/model")
+(require "l2c/tokenizer")
+(require "l2c/sampler")
+
+(define (l2c:generate text n-steps temperature topp)
+  (l2c:load (or (getenv "L2C_WEIGHTS_DIR") "model/tiny"))
+  (tok:load (or (getenv "L2C_TOKENIZER") "model/tokenizer.txt"))
+  (let* ((ids (tok:encode text #t))
+         (out (let drive ((toks ids) (pos 0) (prev -1) (pending n-steps))
+                (if (pair? toks)
+                    (begin
+                      (l2c:forward (car toks) pos)
+                      (drive (cdr toks) (+ pos 1) (car toks) pending))
+                    (if (> pending 0)
+                        (let* ((id (l2c:sample l2c:logits temperature topp))
+                               (piece (tok:decode-piece prev id)))
+                          (display piece)
+                          (l2c:forward id pos)
+                          (drive '() (+ pos 1) id (- pending 1)))
+                        'done)))))
+    (newline)
+    out))

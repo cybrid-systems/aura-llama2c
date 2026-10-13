@@ -26,7 +26,7 @@ def rnd():
 def main() -> None:
     out = sys.argv[1]
     dim, hidden, n_layers = 16, 32, 2
-    n_heads, n_kv_heads, vocab, seq_len = 2, 1, 64, 32
+    n_heads, n_kv_heads, vocab, seq_len = 2, 1, 512, 32
     head_size = dim // n_heads
     kv_dim = head_size * n_kv_heads
 

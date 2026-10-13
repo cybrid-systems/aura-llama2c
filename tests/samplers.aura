@@ -1,0 +1,35 @@
+; tests/samplers.aura — sampler unit test driver
+;
+; Fixed logits, temperature 0.8, topp 0.9, seed 42, 5 draws — the same
+; inputs scripts/sampler_reference.py consumes; the runner diffs the ids.
+
+(require "l2c/model")
+(require "l2c/sampler")
+
+;; l2c:sample/softmax!/argmax use l2c:vocab for extents in the top-p path
+(set! l2c:vocab 8)
+
+(define logits (make-vector 8 0.0))
+(vector-set! logits 0 0.1)
+(vector-set! logits 1 2.5)
+(vector-set! logits 2 -0.3)
+(vector-set! logits 3 1.7)
+(vector-set! logits 4 0.0)
+(vector-set! logits 5 -1.2)
+(vector-set! logits 6 3.1)
+(vector-set! logits 7 0.4)
+
+(sam:seed! 42)
+(display "ids ")
+(let loop ((k 0))
+  (if (< k 5)
+      (begin
+        (display (l2c:sample logits 0.8 0.9))
+        (if (< k 4) (display ","))
+        (loop (+ k 1)))))
+(newline)
+
+;; greedy is unaffected by the seed: must be argmax = 6
+(display "greedy ")
+(display (l2c:sample logits 0.0 0.9))
+(newline)

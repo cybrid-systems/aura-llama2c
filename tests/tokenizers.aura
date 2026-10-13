@@ -1,0 +1,33 @@
+; tests/tokenizers.aura — tokenizer unit test driver
+;
+; Prints encode/decode results in the same layout the test runner compares
+; against scripts/tokenizer_reference.py (python oracle on the same data):
+; ids are comma-separated; decode results are full lines.
+
+(require "l2c/tokenizer")
+
+(tok:load "model/tokenizer.txt")
+
+(define (print-ids ids)
+  (let loop ((ls ids) (k 0))
+    (if (pair? ls)
+        (begin
+          (display (car ls))
+          (if (pair? (cdr ls)) (display ","))
+          (loop (cdr ls) (+ k 1))))))
+
+(display "encode1 ")
+(print-ids (tok:encode "Once upon a time" #t))
+(newline)
+(display "encode2 ")
+(print-ids (tok:encode "Lily and Ben" #t))
+(newline)
+(display "encode3 ")
+(print-ids (tok:encode "" #f))
+(newline)
+(display "decode1 ")
+(display (tok:decode (tok:encode "Once upon a time" #t)))
+(newline)
+(display "decode2 ")
+(display (tok:decode (tok:encode "Zaph" #f)))
+(newline)

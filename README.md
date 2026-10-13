@@ -19,10 +19,12 @@ while porting are filed upstream and tracked in
 | Forward pass: rmsnorm / matmul / RoPE (GQA) / attention+KV / silu FFN / logits | ✅ `lib/l2c/model.aura` |
 | Kernel unit tests (rope, softmax, rmsnorm, matmul) — bit-exact vs float64 oracle | ✅ `tests/` |
 | End-to-end logits vs pure-python float64 reference (`scripts/reference.py`) | ✅ argmax 5/5, \|dlogit\| < 1e-2 |
-| Greedy generation loop | ✅ (token ids; tokenizer is Phase 2) |
-| stories260K end-to-end | ⚠️ runs, but load+forward is minutes-scale on the Soft interpreter (see IMPROVEMENTS) |
-| Phase 2: sentencepiece BPE tokenizer (tok512.bin) | ⬜ |
-| Phase 3: temperature/top-p sampling | ⬜ |
+| Greedy generation loop | ✅ (token ids; see tokenizer) |
+| Sentencepiece BPE tokenizer (encode/decode, byte-fallback, UTF-8 merge) | ✅ `lib/l2c/tokenizer.aura` vs `scripts/tokenizer_reference.py` |
+| Temperature/top-p sampling (Park–Miller LCG, repeated-argmax top-p) | ✅ `lib/l2c/sampler.aura` vs `scripts/sampler_reference.py` |
+| stories260K end-to-end | ⚠️ weights/config validated; generation is GC-bound — minutes per token (see IMPROVEMENTS) |
+| Phase 2: sentencepiece BPE tokenizer (tok512.bin) | ✅ done (see above) |
+| Phase 3: temperature/top-p sampling | ✅ done (see above) |
 
 `STATE.txt` holds the same status in key=value form.
 
@@ -45,11 +47,11 @@ bash tests/run_tests.sh
 L2C_WEIGHTS_DIR=model/tiny $AURA_BIN -e '(require "l2c/model") (l2c:main (list 1 8 61) 10)'
 ```
 
-The tiny model (`scripts/make_tiny_model.py` → `model/tiny.bin`, 4.3K params)
-is the correctness bed: it loads in seconds and the float64 reference pins
+The tiny model (`scripts/make_tiny_model.py` → `model/tiny.bin`, 21K params)
+is the correctness bed: it loads in ~a minute and the float64 reference pins
 every logit. `wq`/`wk` are deliberately scaled ×20 there so attention scores
 are live — with the original 0.05 scale every softmax was uniform and no RoPE
-bug could show up in the logits.
+bug could show up in the logits. Its vocab is 512 to match tok512.
 
 The real model (tinyllamas `stories260K`, 260K params, GQA 8/4 heads,
 vocab 512) converts with `scripts/export_weights.py`:
@@ -64,6 +66,25 @@ L2C_WEIGHTS_DIR=model/stories260K $AURA_BIN -e '(require "l2c/model") (l2c:main 
 Expect minutes per token on the Soft interpreter — the port is currently
 memory/GC-bound, not FLOP-bound (see IMPROVEMENTS.md). That gap is the port's
 reason to exist: every multiplier there is an Aura improvement issue.
+
+## Text generation end-to-end
+
+```bash
+L2C_WEIGHTS_DIR=model/tiny L2C_TOKENIZER=model/tokenizer.txt \
+  $AURA_BIN -e '(require "l2c/generate") (l2c:generate "Once upon a time" 15 0.0 0.9)'
+```
+
+The compiled C reference doubles as a string-level oracle for the same
+vocab (the exporter also emits llama2.c-format `tokenizer_llama2c.bin`):
+
+```bash
+cc run.c -O2 -o run -lm   # from karpathy/llama2.c
+run model/tiny.bin -z model/tokenizer_llama2c.bin -t 0 -n 15 -i "Once upon a time"
+```
+
+Note the llama2.c tokenizer convention: sentencepiece's U+2581 marker is
+stored as a literal space, so run.c's dummy-prefix `str_lookup(" ")` resolves
+(the exporter handles this; a vocab without it segfaults run.c on `vocab[-1]`).
 
 ## Layout
 

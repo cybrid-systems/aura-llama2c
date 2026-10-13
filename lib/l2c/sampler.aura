@@ -1,0 +1,80 @@
+; lib/l2c/sampler.aura — temperature/top-p sampling (port of run.c's sample())
+;
+; Divergence from run.c, documented in IMPROVEMENTS.md: run.c uses xorshift64
+; over unsigned 64-bit ints; Aura fixnums are 63-bit signed with no unsigned
+; word type, so both the Aura implementation and the Python oracle use a
+; Park-Miller LCG (state 1..2^31-2) instead. Aura and the oracle agree
+; bit-for-bit; neither matches run.c's exact random stream (irrelevant for
+; correctness - sampling is stochastic by nature).
+;
+; top-p uses repeated argmax extraction instead of sorting: the extracted
+; order is descending probability, which is the same order run.c's sorted
+; prefix visits, so the cdf walk is identical.
+
+(require "l2c/model")
+
+(define sam:state 20261013)
+
+(define (sam:seed! s)
+  (set! sam:state (+ 1 (remainder s 2147483646))))
+
+; Park-Miller, [0,1)
+; NOTE: (/ sam:state 2147483647) would be exact-int division -> 0 forever
+; (#4499 - filed from this very port); force float division.
+(define (sam:rand)
+  (set! sam:state (remainder (* sam:state 48271) 2147483647))
+  (/ (* 1.0 sam:state) 2147483647))
+
+; sample one id from logits given temperature and topp
+; temperature <= 0 -> greedy argmax
+(define (l2c:sample logits temperature topp)
+  (if (<= temperature 0.0)
+      (l2c:argmax logits l2c:vocab)
+      (let ((v (make-vector l2c:vocab 0.0)))
+        (let loop ((i 0))
+          (if (< i l2c:vocab)
+              (begin
+                (vector-set! v i (/ (vector-ref logits i) temperature))
+                (loop (+ i 1)))))
+        (l2c:softmax! v l2c:vocab)
+        ;; extract the minimal descending-probability prefix with cumsum >=
+        ;; topp; chosen accumulates reversed, i.e. it is in ascending
+        ;; extraction order... extraction pops the argmax each time, so
+        ;; `chosen` is reversed (descending). Walk order below must be
+        ;; descending probability, i.e. (reverse chosen).
+        (let* ((chosen-rev
+                (let extract ((chosen '()) (cum 0.0))
+                  (if (< cum topp)
+                      (let* ((i (l2c:argmax v l2c:vocab))
+                             (p (vector-ref v i)))
+                        (vector-set! v i -1.0)
+                        (extract (cons (cons i p) chosen) (+ cum p)))
+                      chosen)))
+               ;; descending order (highest prob first)
+               (desc (reverse chosen-rev))
+               (sum (let s ((ls desc) (acc 0.0))
+                      (if (pair? ls)
+                          (s (cdr ls) (+ acc (cdar ls)))
+                          acc)))
+               (r (* (sam:rand) sum)))
+          (let walk ((ls desc) (acc 0.0))
+            (if (pair? ls)
+                (let ((acc2 (+ acc (cdar ls))))
+                  (if (< r acc2)
+                      (caar ls)
+                      (walk (cdr ls) acc2)))
+                (caar ls)))))))
+
+; convenience: generate ids greedily or sampled, appending to a prompt
+; returns the full id list (prompt ids followed by generated ids)
+(define (l2c:generate-ids tokens n-steps temperature topp)
+  (let loop ((toks tokens) (pos 0) (out '()) (pending n-steps))
+    (if (pair? toks)
+        (begin
+          (l2c:forward (car toks) pos)
+          (loop (cdr toks) (+ pos 1) (cons (car toks) out) pending))
+        (if (> pending 0)
+            (let* ((id (l2c:sample l2c:logits temperature topp)))
+              (l2c:forward id pos)
+              (loop '() (+ pos 1) (cons id out) (- pending 1)))
+            (reverse out)))))
